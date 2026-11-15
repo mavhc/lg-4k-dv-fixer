@@ -93,21 +93,48 @@ conversion; use `-k` when you want to keep it.
 ### HDR10+ removal
 
 The HEVC stream is extracted to a pipe, cleaned by
-`dovi_tool --drop-hdr10plus convert`, and muxed straight into the output MP4.
-Dolby Vision RPU data is preserved. No intermediate video or audio file is
-written, so a two-hour 4K episode needs only a few megabytes of temporary
-space.
+`dovi_tool --drop-hdr10plus convert`, stamped and wrapped in a timed stream
+(see below), and muxed straight into the output MP4. Dolby Vision RPU data is
+preserved. No intermediate video or audio file is written, so a two-hour 4K
+episode needs only a few megabytes of temporary space.
 
-### TV-friendly MP4 layout
+### Interleaved, timed video stream
 
-The final MP4 uses the standard ffmpeg layout (`ftyp / mdat / moov`, with
-`moov` at the end). Large `moov`-at-front padding and fragmented MP4 both
-caused webOS to spin or freeze a second into playback, so neither is used.
+Raw HEVC carries no packet timestamps. Piping it straight into the final mux
+means ffmpeg cannot interleave it with the audio, so it writes the whole video
+track first and the audio track afterwards. A desktop player can seek around
+that, but LG webOS stalls: by the end of a two-hour 4K episode the audio sits
+several gigabytes away from the video it belongs to, and the set never gets
+past the first frame.
 
-Because the video is piped as raw HEVC, ffmpeg cannot know the original B-frame
-presentation order. The script copies the source packet timestamps into fresh
-`stts`/`ctts` tables after muxing, and re-inserts the Dolby Vision
-configuration record, without touching the media data or chunk offsets.
+The muxing step therefore gives the video packets real timestamps before they
+reach the final mux:
+
+- `setts` stamps every frame at the constant frame rate (the source is CFR),
+- the stamped stream is wrapped in a timed NUT pipe,
+- the final mux then sees ordinary DTS/PTS and interleaves video and audio in
+  short chunks.
+
+Packet payloads are copied unchanged, so the video and audio data are identical
+to the source after HDR10+ removal.
+
+Because the video arrives as a pipe, ffmpeg also cannot know the original
+B-frame presentation order. The script copies the source packet timestamps into
+fresh `stts`/`ctts` tables after muxing and re-inserts the Dolby Vision
+configuration record, without touching the media data.
+
+As a final compatibility step the index is rewritten into the layout ffmpeg
+emits for a normally timed input:
+
+- one sample per chunk (a single `stsc` entry, one chunk offset per sample),
+- ffmpeg child order (`stsd`, `stts`, `stss`, `ctts`, `stsc`, `stsz`, `co64`),
+- `tkhd`, `elst` and `mvhd` durations consistent with `mdhd`.
+
+The normaliser changes only index bytes; no temporary file is written. The
+`moov` is then shifted to the front in place (`ftyp / moov / free / mdat`) so
+playback starts without seeking to the end of the file. Interleaving was the
+decisive fix for webOS; the index rewrite and faststart keep the file in the
+same shape as ffmpeg's own output.
 
 ### Audio over ARC
 

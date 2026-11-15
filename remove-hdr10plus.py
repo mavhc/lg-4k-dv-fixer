@@ -85,14 +85,18 @@ def probe(path):
   )
 
 
-def get_video_packet_pts(path):
+def get_video_packet_pts(path, progress=None):
   """Presentation timestamps of the video packets, in decode order.
 
   These are used later to rebuild the MP4's composition offsets: a raw HEVC
   pipe carries no timestamps, so the muxed file would otherwise present frames
   in decode order (wrong for B-frames).
+
+  ``progress`` is an optional callback invoked with the number of packets read
+  so far (and ``done=True`` at the end), so callers can display activity while
+  a large file is scanned.
   """
-  result = subprocess.run(
+  proc = subprocess.Popen(
       [
           "ffprobe",
           "-v",
@@ -109,19 +113,31 @@ def get_video_packet_pts(path):
       stderr=subprocess.DEVNULL,
       text=True,
   )
-  if result.returncode != 0:
-    return []
 
   timestamps = []
-  for line in result.stdout.splitlines():
-    value = line.strip().strip(",")
-    if not value or value == "N/A":
-      timestamps.append(None)
-      continue
-    try:
-      timestamps.append(float(value))
-    except ValueError:
-      timestamps.append(None)
+  try:
+    for line in proc.stdout:
+      value = line.strip().strip(",")
+      if not value or value == "N/A":
+        timestamps.append(None)
+      else:
+        try:
+          timestamps.append(float(value))
+        except ValueError:
+          timestamps.append(None)
+      if progress is not None and len(timestamps) % 256 == 0:
+        progress(len(timestamps))
+  except BaseException:
+    proc.kill()
+    raise
+  finally:
+    returncode = proc.wait()
+
+  if progress is not None:
+    progress(len(timestamps), done=True)
+
+  if returncode != 0:
+    return []
   return timestamps
 
 
@@ -138,7 +154,7 @@ def get_pre_roll(timestamps, rate):
   return frames / float(rate)
 
 
-def probe_source(path):
+def probe_source(path, progress=None):
   data = probe(path)
   streams = data.get("streams", [])
 
@@ -197,7 +213,14 @@ def probe_source(path):
       dovi = side_data
       break
 
-  packet_pts = get_video_packet_pts(path)
+  packet_progress = None
+  if progress is not None:
+    estimated_packets = int(duration * float(rate)) if duration > 0 else 0
+
+    def packet_progress(count, done=False):
+      progress(count, estimated_packets, done)
+
+  packet_pts = get_video_packet_pts(path, progress=packet_progress)
   pre_roll = get_pre_roll(packet_pts, rate)
   known_pts = [value for value in packet_pts if value is not None]
   if known_pts:
@@ -711,6 +734,419 @@ def repair_video_timing(path, info):
     os.fsync(handle.fileno())
 
   return True
+
+
+# ---------------------------------------------------------------------------
+# Container layout
+# ---------------------------------------------------------------------------
+_LAYOUT_CONTAINERS = {
+    b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"dinf", b"udta",
+    b"mvex",
+}
+_LAYOUT_ORDER = [
+    b"stsd", b"stts", b"stss", b"ctts", b"stsc", b"stsz", b"co64", b"stco",
+]
+
+
+def _layout_box(box_type, payload):
+  return struct.pack(">I4s", len(payload) + 8, box_type) + payload
+
+
+def _layout_child(moov, start, end, box_type):
+  for pos, kind, size, header in iter_boxes(moov, start, end):
+    if kind == box_type:
+      return pos, size, header
+  return None
+
+
+def _layout_handler(moov, start, end):
+  for pos, kind, size, header in iter_boxes(moov, start, end):
+    if kind == b"hdlr":
+      return moov[pos + header + 8:pos + header + 12]
+    if kind in _LAYOUT_CONTAINERS:
+      found = _layout_handler(moov, pos + header, pos + size)
+      if found:
+        return found
+  return None
+
+
+def _layout_expand_chunks(stsc_entries, chunk_offsets, sizes):
+  """Return every sample's absolute file offset, in sample order."""
+  offsets = []
+  index = 0
+  chunk_count = len(chunk_offsets)
+  for i, (first, per, _desc) in enumerate(stsc_entries):
+    last = (
+        stsc_entries[i + 1][0] - 1 if i + 1 < len(stsc_entries)
+        else chunk_count
+    )
+    for chunk in range(first, last + 1):
+      cursor = chunk_offsets[chunk - 1]
+      for _ in range(per):
+        if index >= len(sizes):
+          break
+        offsets.append(cursor)
+        cursor += sizes[index]
+        index += 1
+  if index != len(sizes) or len(offsets) != len(sizes):
+    return None
+  return offsets
+
+
+def normalise_container(path):
+  """Rewrite the MP4 index into the layout ffmpeg writes for timed input.
+
+  The HDR10+ pipeline muxes raw HEVC, so ffmpeg has no presentation
+  timestamps and writes a decode-order index with multi-sample chunks; the
+  timing repair then patches stts/ctts.  Some players (LG webOS among them)
+  refuse that layout even though the tables are self-consistent.
+
+  This rebuilds only the moov, in place:
+
+    * one sample per chunk (single stsc entry, one offset per sample)
+    * ffmpeg child order (stsd, stts, stss, ctts, stsc, stsz, co64)
+    * tkhd, elst and mvhd durations consistent with mdhd
+
+  Media data is never moved and no temporary file is used.
+  """
+  file_size = os.path.getsize(path)
+  with open(path, "r+b") as handle:
+    boxes = list(top_level_boxes(handle, file_size))
+    moov_box = next((b for b in boxes if b[1] == b"moov"), None)
+    if moov_box is None:
+      return False
+    moov_offset, _, moov_size, moov_header = moov_box
+
+    handle.seek(moov_offset)
+    moov = handle.read(moov_size)
+    if len(moov) != moov_size:
+      return False
+
+    replacements = {}
+    media = []
+
+    for trak_pos, _, trak_size, trak_header in [
+        b for b in iter_boxes(moov, moov_header, len(moov))
+        if b[1] == b"trak"
+    ]:
+      handler = _layout_handler(
+          moov, trak_pos + trak_header, trak_pos + trak_size
+      )
+      media_ts = 0
+      media_dur = 0
+      new_stbl = None
+
+      mdia = _layout_child(
+          moov, trak_pos + trak_header, trak_pos + trak_size, b"mdia"
+      )
+      if mdia is None:
+        media.append((media_ts, media_dur))
+        continue
+      mdia_pos, mdia_size, mdia_header = mdia
+
+      mdhd = _layout_child(
+          moov, mdia_pos + mdia_header, mdia_pos + mdia_size, b"mdhd"
+      )
+      if mdhd is None:
+        media.append((media_ts, media_dur))
+        continue
+      mdhd_pos, _, mdhd_header = mdhd
+      if moov[mdhd_pos + mdhd_header] == 0:
+        media_ts = struct.unpack(
+            ">I", moov[mdhd_pos + mdhd_header + 12:mdhd_pos + mdhd_header + 16]
+        )[0]
+        media_dur = struct.unpack(
+            ">I", moov[mdhd_pos + mdhd_header + 16:mdhd_pos + mdhd_header + 20]
+        )[0]
+      else:
+        media_ts = struct.unpack(
+            ">I", moov[mdhd_pos + mdhd_header + 20:mdhd_pos + mdhd_header + 24]
+        )[0]
+        media_dur = struct.unpack(
+            ">Q", moov[mdhd_pos + mdhd_header + 24:mdhd_pos + mdhd_header + 32]
+        )[0]
+
+      minf = _layout_child(
+          moov, mdia_pos + mdia_header, mdia_pos + mdia_size, b"minf"
+      )
+      if minf is None:
+        media.append((media_ts, media_dur))
+        continue
+      minf_pos, minf_size, minf_header = minf
+
+      stbl = _layout_child(
+          moov, minf_pos + minf_header, minf_pos + minf_size, b"stbl"
+      )
+      if stbl is None:
+        media.append((media_ts, media_dur))
+        continue
+      stbl_pos, stbl_size, stbl_header = stbl
+
+      children = list(iter_boxes(
+          moov, stbl_pos + stbl_header, stbl_pos + stbl_size
+      ))
+      by_type = {kind: (pos, size, header)
+                 for pos, kind, size, header in children}
+
+      chunk_kind = b"co64" if b"co64" in by_type else b"stco"
+      chunk_box = by_type.get(chunk_kind)
+      if b"stsz" not in by_type or b"stsc" not in by_type or chunk_box is None:
+        media.append((media_ts, media_dur))
+        continue
+
+      stsz_pos, stsz_size, stsz_header = by_type[b"stsz"]
+      body = moov[stsz_pos + stsz_header:stsz_pos + stsz_size]
+      constant = struct.unpack(">I", body[4:8])[0]
+      count = struct.unpack(">I", body[8:12])[0]
+      if constant:
+        sizes = [constant] * count
+      else:
+        sizes = list(struct.unpack(">%dI" % count, body[12:12 + 4 * count]))
+
+      stsc_pos, stsc_size, stsc_header = by_type[b"stsc"]
+      body = moov[stsc_pos + stsc_header:stsc_pos + stsc_size]
+      entries = struct.unpack(">I", body[4:8])[0]
+      stsc_entries = [
+          struct.unpack(">III", body[8 + 12 * i:20 + 12 * i])
+          for i in range(entries)
+      ]
+
+      chunk_pos, chunk_size, chunk_header = chunk_box
+      body = moov[chunk_pos + chunk_header:chunk_pos + chunk_size]
+      chunk_count = struct.unpack(">I", body[4:8])[0]
+      if chunk_kind == b"stco":
+        chunk_offsets = list(struct.unpack(
+            ">%dI" % chunk_count, body[8:8 + 4 * chunk_count]
+        ))
+      else:
+        chunk_offsets = list(struct.unpack(
+            ">%dQ" % chunk_count, body[8:8 + 8 * chunk_count]
+        ))
+
+      offsets = _layout_expand_chunks(stsc_entries, chunk_offsets, sizes)
+      if offsets is None:
+        print(
+            f"  Warning: {handler!r} chunk table is inconsistent; "
+            "index left unchanged.",
+            file=sys.stderr,
+        )
+        media.append((media_ts, media_dur))
+        continue
+
+      use64 = chunk_kind == b"co64" or any(
+          value > 0xFFFFFFFF for value in offsets
+      )
+      if use64:
+        table = _layout_box(
+            b"co64",
+            struct.pack(">I", 0) + struct.pack(">I", len(offsets))
+            + struct.pack(">%dQ" % len(offsets), *offsets),
+        )
+      else:
+        table = _layout_box(
+            b"stco",
+            struct.pack(">I", 0) + struct.pack(">I", len(offsets))
+            + struct.pack(">%dI" % len(offsets), *offsets),
+        )
+      new_stsc = _layout_box(
+          b"stsc",
+          struct.pack(">I", 0) + struct.pack(">I", 1)
+          + struct.pack(">III", 1, 1, 1),
+      )
+
+      ordered = []
+      for kind in _LAYOUT_ORDER:
+        if kind == b"stsc":
+          ordered.append(new_stsc)
+        elif kind in (b"stco", b"co64"):
+          if kind == chunk_kind and table is not None:
+            ordered.append(table)
+            table = None
+        elif kind in by_type:
+          pos, box_size, _ = by_type[kind]
+          ordered.append(moov[pos:pos + box_size])
+      for pos, kind, box_size, _ in children:
+        if kind not in _LAYOUT_ORDER:
+          ordered.append(moov[pos:pos + box_size])
+
+      new_stbl = _layout_box(b"stbl", b"".join(ordered))
+      replacements[stbl_pos] = new_stbl
+      media.append((media_ts, media_dur))
+
+    if not replacements:
+      return False
+
+    def rebuild(start, end):
+      out = []
+      for pos, kind, box_size, header in iter_boxes(moov, start, end):
+        if kind == b"stbl" and pos in replacements:
+          out.append(replacements[pos])
+        elif kind in _LAYOUT_CONTAINERS:
+          out.append(_layout_box(kind, rebuild(pos + header, pos + box_size)))
+        else:
+          out.append(moov[pos:pos + box_size])
+      return b"".join(out)
+
+    new_moov = bytearray(_layout_box(b"moov", rebuild(moov_header, len(moov))))
+
+    movie_ts = 0
+    for pos, kind, _, header in iter_boxes(new_moov, 8, len(new_moov)):
+      if kind == b"mvhd":
+        offset = 20 if new_moov[pos + header] == 1 else 12
+        movie_ts = struct.unpack(
+            ">I", new_moov[pos + header + offset:pos + header + offset + 4]
+        )[0]
+        break
+    if not movie_ts:
+      return False
+
+    traks = [b for b in iter_boxes(new_moov, 8, len(new_moov)) if b[1] == b"trak"]
+    longest = 0
+    for index, (trak_pos, _, trak_size, trak_header) in enumerate(traks):
+      media_ts, media_dur = media[index] if index < len(media) else (0, 0)
+      if not media_ts or not media_dur:
+        continue
+      scaled = round(media_dur * movie_ts / media_ts)
+      longest = max(longest, scaled)
+
+      tkhd = _layout_child(
+          new_moov, trak_pos + trak_header, trak_pos + trak_size, b"tkhd"
+      )
+      if tkhd is not None:
+        tpos, _, theader = tkhd
+        if new_moov[tpos + theader] == 0:
+          struct.pack_into(">I", new_moov, tpos + theader + 20, scaled)
+        else:
+          struct.pack_into(">Q", new_moov, tpos + theader + 28, scaled)
+
+      edts = _layout_child(
+          new_moov, trak_pos + trak_header, trak_pos + trak_size, b"edts"
+      )
+      if edts is not None:
+        epos, esize, eheader = edts
+        elst = _layout_child(new_moov, epos + eheader, epos + esize, b"elst")
+        if elst is not None:
+          lpos, lsize, lheader = elst
+          body = new_moov[lpos + lheader:lpos + lsize]
+          version = body[0]
+          count = struct.unpack(">I", body[4:8])[0]
+          offset = 8
+          for _ in range(count):
+            if version == 0:
+              struct.pack_into(">I", new_moov, lpos + lheader + offset, scaled)
+              offset += 12
+            else:
+              struct.pack_into(">Q", new_moov, lpos + lheader + offset, scaled)
+              offset += 20
+
+    for pos, kind, _, header in iter_boxes(new_moov, 8, len(new_moov)):
+      if kind == b"mvhd":
+        if new_moov[pos + header] == 0:
+          struct.pack_into(">I", new_moov, pos + header + 16, longest)
+        else:
+          struct.pack_into(">Q", new_moov, pos + header + 24, longest)
+        break
+
+    if not _replace_moov(handle, moov_offset, moov_size, new_moov, file_size):
+      return False
+
+    handle.flush()
+    os.fsync(handle.fileno())
+
+  print(
+      f"  Index normalised: moov {moov_size} -> {len(new_moov)} bytes, "
+      "one sample per chunk."
+  )
+  return True
+
+
+def relocate_moov(path):
+  """Move a trailing moov box to the front, in place (faststart)."""
+  file_size = os.path.getsize(path)
+  with open(path, "r+b") as handle:
+    boxes = list(top_level_boxes(handle, file_size))
+    kinds = [box[1] for box in boxes]
+    if b"moov" not in kinds or b"mdat" not in kinds:
+      return False
+    if kinds.index(b"moov") < kinds.index(b"mdat"):
+      return True
+    if kinds[-1] != b"moov" or kinds[0] != b"ftyp":
+      return False
+
+    moov = next(box for box in boxes if box[1] == b"moov")
+    mdat = next(box for box in boxes if box[1] == b"mdat")
+    ftyp_end = boxes[0][2]
+    moov_offset, _, moov_size, _ = moov
+    mdat_offset = mdat[0]
+
+    for pos, kind, _, _ in boxes:
+      if pos < mdat_offset and kind not in (b"ftyp", b"free", b"skip"):
+        return False
+
+    pre_size = mdat_offset - ftyp_end
+    new_mdat_offset = ftyp_end + moov_size + 8
+    delta = new_mdat_offset - mdat_offset
+    new_end = file_size + 8 - pre_size
+    if delta < 0:
+      return False
+
+    handle.seek(moov_offset)
+    moov_data = bytearray(handle.read(moov_size))
+    if len(moov_data) != moov_size:
+      return False
+
+    def shift(start, end, amount):
+      for pos, kind, size, header in iter_boxes(moov_data, start, end):
+        if kind == b"stco":
+          count = struct.unpack(
+              ">I", moov_data[pos + header + 4:pos + header + 8]
+          )[0]
+          offset = pos + header + 8
+          for _ in range(count):
+            value = struct.unpack(">I", moov_data[offset:offset + 4])[0]
+            if value + amount > 0xFFFFFFFF:
+              raise ValueError("chunk offset overflow; co64 required")
+            struct.pack_into(">I", moov_data, offset, value + amount)
+            offset += 4
+        elif kind == b"co64":
+          count = struct.unpack(
+              ">I", moov_data[pos + header + 4:pos + header + 8]
+          )[0]
+          offset = pos + header + 8
+          for _ in range(count):
+            value = struct.unpack(">Q", moov_data[offset:offset + 8])[0]
+            struct.pack_into(">Q", moov_data, offset, value + amount)
+            offset += 8
+        elif kind in _LAYOUT_CONTAINERS:
+          shift(pos + header, pos + size, amount)
+
+    shift(0, len(moov_data), delta)
+
+    chunk = 8 * 1024 * 1024
+    os.ftruncate(handle.fileno(), file_size + delta)
+    pos = moov_offset
+    while pos > mdat_offset:
+      step = min(chunk, pos - mdat_offset)
+      pos -= step
+      handle.seek(pos)
+      data = handle.read(step)
+      if len(data) != step:
+        return False
+      handle.seek(pos + delta)
+      handle.write(data)
+
+    handle.seek(ftyp_end)
+    handle.write(moov_data)
+    handle.seek(ftyp_end + moov_size)
+    handle.write(struct.pack(">I4s", 8, b"free"))
+    os.ftruncate(handle.fileno(), new_end)
+    handle.flush()
+    os.fsync(handle.fileno())
+
+  print(f"  moov moved to the front (media shifted {delta} bytes).")
+  return True
+
+
 def check_space(input_path, output_path):
   input_size = os.path.getsize(input_path)
   free = shutil.disk_usage(os.path.dirname(input_path)).free
@@ -800,6 +1236,7 @@ def remux_streaming(source, info, audio_path, output_path, use_dovi_tool,
 
   extract_log = os.path.join(work_dir, "ffmpeg_extract.log")
   dovi_log = os.path.join(work_dir, "dovi_tool.log")
+  wrap_log = os.path.join(work_dir, "ffmpeg_wrap.log")
   mux_log = os.path.join(work_dir, "ffmpeg_mux.log")
 
   extract_cmd = [
@@ -824,7 +1261,47 @@ def remux_streaming(source, info, audio_path, output_path, use_dovi_tool,
       "pipe:1",
   ]
 
+  # Input 0 is the timed NUT stream produced by wrap_cmd, so let ffmpeg
+  # detect the format.  Declaring it as raw HEVC here makes the demuxer
+  # misparse the wrapper and silently truncate the video track.
   mux_cmd = [
+      "ffmpeg",
+      "-nostdin",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      "pipe:0",
+  ]
+  expected_duration = info["video_media_end"]
+  if audio_path:
+    # -itsoffset applies to the next input, so it must be placed directly
+    # before the audio file (not before the video pipe).
+    if abs(audio_offset) >= 0.0005:
+      mux_cmd += ["-itsoffset", f"{audio_offset:.6f}"]
+    # Cap the audio at the source's presented duration.  Some containers hide
+    # trailing audio behind an edit list; the edit list is gone once the
+    # streams have been extracted, so apply the limit here as well.  The cap
+    # is an input option so it never drops video packets (their timestamps are
+    # synthetic and may not line up with the source's edit list).
+    if expected_duration > 0:
+      mux_cmd += ["-t", f"{expected_duration:.6f}"]
+    mux_cmd += ["-i", audio_path]
+
+  mux_cmd += ["-map", "0:v:0"]
+  if audio_path:
+    mux_cmd += ["-map", "1:a:0"]
+
+  factor = max(1, -(-1000 // info["rate"].numerator))
+  timescale = info["rate"].numerator * factor
+
+  # Raw HEVC carries no timestamps, so the muxer cannot interleave the audio
+  # and writes every video packet before the audio track.  Players that read
+  # such a file sequentially then stall trying to reach the audio at the end
+  # of a multi-gigabyte file.  Stamp each packet at the constant frame rate
+  # and wrap the stream in a timed pipe (NUT) so the muxer sees real DTS.
+  ticks = factor * info["rate"].denominator
+  wrap_cmd = [
       "ffmpeg",
       "-nostdin",
       "-hide_banner",
@@ -836,32 +1313,18 @@ def remux_streaming(source, info, audio_path, output_path, use_dovi_tool,
       "hevc",
       "-i",
       "pipe:0",
+      "-c",
+      "copy",
+      "-bsf:v",
+      f"setts=dts=N*{ticks}:pts=N*{ticks}:time_base=1/{timescale}",
+      "-f",
+      "nut",
+      "pipe:1",
   ]
-  if audio_path:
-    # -itsoffset applies to the next input, so it must be placed directly
-    # before the audio file (not before the video pipe).
-    if abs(audio_offset) >= 0.0005:
-      mux_cmd += ["-itsoffset", f"{audio_offset:.6f}"]
-    mux_cmd += ["-i", audio_path]
 
-  mux_cmd += ["-map", "0:v:0"]
-  if audio_path:
-    mux_cmd += ["-map", "1:a:0"]
-
-  # Cap the output at the source's presented duration.  Some containers hide
-  # trailing audio (or video) behind an edit list; the edit list is gone once
-  # the streams have been extracted, so apply the limit here as well.
-  expected_duration = info["video_media_end"]
-  if expected_duration > 0:
-    mux_cmd += ["-t", f"{expected_duration:.6f}"]
-
-  factor = max(1, -(-1000 // info["rate"].numerator))
-  timescale = info["rate"].numerator * factor
-
-  # Write a plain ffmpeg MP4 (moov after mdat, no padding).  A padded moov at
-  # the front makes LG webOS players hang forever on large files, while this
-  # standard layout direct-plays correctly.  The DV box and the B-frame timing
-  # tables are patched into the trailing moov afterwards.
+  # Write a plain ffmpeg MP4 (moov after mdat, no padding).  The index is
+  # normalised and moved to the front afterwards: a moov written by the piped
+  # mux does not direct-play on LG webOS, while ffmpeg's normal layout does.
   mux_cmd += [
       "-c",
       "copy",
@@ -881,6 +1344,7 @@ def remux_streaming(source, info, audio_path, output_path, use_dovi_tool,
 
   extract_log_file = open(extract_log, "w")
   dovi_log_file = open(dovi_log, "w")
+  wrap_log_file = open(wrap_log, "w")
   mux_log_file = open(mux_log, "w")
 
   try:
@@ -898,38 +1362,44 @@ def remux_streaming(source, info, audio_path, output_path, use_dovi_tool,
           stderr=dovi_log_file,
       )
       p_extract.stdout.close()
-      p_mux = subprocess.Popen(
-          mux_cmd,
-          stdin=p_dovi.stdout,
-          stdout=subprocess.DEVNULL,
-          stderr=mux_log_file,
-      )
-      p_dovi.stdout.close()
+      producer = p_dovi
     else:
       p_dovi = None
-      p_mux = subprocess.Popen(
-          mux_cmd,
-          stdin=p_extract.stdout,
-          stdout=subprocess.DEVNULL,
-          stderr=mux_log_file,
-      )
-      p_extract.stdout.close()
+      producer = p_extract
+
+    p_wrap = subprocess.Popen(
+        wrap_cmd,
+        stdin=producer.stdout,
+        stdout=subprocess.PIPE,
+        stderr=wrap_log_file,
+    )
+    producer.stdout.close()
+    p_mux = subprocess.Popen(
+        mux_cmd,
+        stdin=p_wrap.stdout,
+        stdout=subprocess.DEVNULL,
+        stderr=mux_log_file,
+    )
+    p_wrap.stdout.close()
 
     mux_rc = p_mux.wait()
     if p_dovi is not None:
       dovi_rc = p_dovi.wait()
     else:
       dovi_rc = 0
+    wrap_rc = p_wrap.wait()
     extract_rc = p_extract.wait()
+    if mux_rc == 0 and wrap_rc != 0:
+      mux_rc = wrap_rc
 
     if mux_rc != 0:
-      for process in (p_mux, p_dovi, p_extract):
+      for process in (p_mux, p_wrap, p_dovi, p_extract):
         if process is not None and process.poll() is None:
           process.terminate()
     return mux_rc, dovi_rc, extract_rc
   finally:
-    for process in (locals().get("p_mux"), locals().get("p_dovi"),
-                    locals().get("p_extract")):
+    for process in (locals().get("p_mux"), locals().get("p_wrap"),
+                    locals().get("p_dovi"), locals().get("p_extract")):
       if process is not None and process.poll() is None:
         try:
           process.kill()
@@ -937,6 +1407,7 @@ def remux_streaming(source, info, audio_path, output_path, use_dovi_tool,
           pass
     extract_log_file.close()
     dovi_log_file.close()
+    wrap_log_file.close()
     mux_log_file.close()
 
 
@@ -1177,6 +1648,15 @@ def main():
             "Could not inject the Dolby Vision configuration record into the "
             "output MP4. The file was left in place for inspection."
         )
+
+    print("Normalising MP4 index...")
+    if not normalise_container(output_path):
+      die(
+          "Could not normalise the MP4 sample index. The file was left in "
+          "place for inspection."
+      )
+
+    relocate_moov(output_path)
 
     problems, output_data = verify_output(
         output_path, info, use_dovi_tool, had_audio

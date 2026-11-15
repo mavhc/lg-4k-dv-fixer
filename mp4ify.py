@@ -133,6 +133,48 @@ def run_with_progress(proc, total_us):
     bar.close()
 
 
+def make_analysis_progress(label):
+    """Return (callback, close) for a tqdm bar driven by packet scanning.
+
+    The total frame count is not known until the scanner reports it, so the
+    bar is created with an unknown total and upgraded on the first update.
+    """
+    state = {"bar": None}
+
+    def callback(count, total=0, done=False):
+        bar = state["bar"]
+        if bar is None:
+            bar = tqdm(
+                total=total or None,
+                unit=" frames",
+                bar_format=(
+                    f"  {label}: {{l_bar}}{{bar}}| "
+                    "{n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+                ),
+                leave=True,
+                file=sys.stderr,
+            )
+            state["bar"] = bar
+        elif total and bar.total != total:
+            bar.total = total
+            bar.refresh()
+        if count > bar.n:
+            bar.update(count - bar.n)
+        elif done:
+            bar.refresh()
+        if done:
+            bar.close()
+            state["bar"] = None
+
+    def close():
+        bar = state["bar"]
+        if bar is not None:
+            bar.close()
+            state["bar"] = None
+
+    return callback, close
+
+
 def probe_media_file(file_path):
     """
     Probe format tags and stream information using ffprobe.
@@ -721,6 +763,31 @@ def remux_hdr10plus(
     rate = module.rate_arg(info["rate"])
     factor = max(1, -(-1000 // info["rate"].numerator))
     timescale = info["rate"].numerator * factor
+    # Raw HEVC has no timestamps, so the muxer cannot interleave audio with
+    # video and writes the whole video track first.  Stamp the packets at the
+    # constant frame rate and wrap them in a timed pipe (NUT) so the muxer can
+    # interleave normally.
+    ticks = factor * info["rate"].denominator
+    wrap_cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-r",
+        rate,
+        "-f",
+        "hevc",
+        "-i",
+        "pipe:0",
+        "-c",
+        "copy",
+        "-bsf:v",
+        f"setts=dts=N*{ticks}:pts=N*{ticks}:time_base=1/{timescale}",
+        "-f",
+        "nut",
+        "pipe:1",
+    ]
     offset = module.audio_offset_for_mux(info)
     base_input = 1  # input 0 is the cleaned HEVC pipe, input 1 the original
 
@@ -746,23 +813,26 @@ def remux_hdr10plus(
         "pipe:1",
     ]
 
+    # Input 0 is the timed NUT stream produced by wrap_cmd, so let ffmpeg
+    # detect the format.  Declaring it as raw HEVC here makes the demuxer
+    # misparse the wrapper and silently truncate the video track.
     mux_cmd = [
         "ffmpeg",
         "-nostdin",
         "-hide_banner",
         "-loglevel",
         "error",
-        "-r",
-        rate,
-        "-f",
-        "hevc",
         "-i",
         "pipe:0",
     ]
     # Keep audio aligned with the piped video (positive offsets are clamped to
-    # zero so the track starts at 0, which some TVs require).
+    # zero so the track starts at 0, which some TVs require).  The duration cap
+    # is an input option so it trims trailing audio/subtitles from the source
+    # without dropping video packets from the pipe.
     if abs(offset) >= 0.0005:
         mux_cmd += ["-itsoffset", f"{offset:.6f}"]
+    if info["video_media_end"]:
+        mux_cmd += ["-t", f"{info['video_media_end']:.6f}"]
     mux_cmd += ["-i", str(file_path)]
     for sub_path, _ in external_subs:
         mux_cmd += ["-i", str(sub_path)]
@@ -804,10 +874,6 @@ def remux_hdr10plus(
                     f"language={lang}",
                 ]
 
-    # Trim any trailing audio hidden by the source container's edit list.
-    if info["video_media_end"]:
-        mux_cmd += ["-t", f"{info['video_media_end']:.6f}"]
-
     mux_cmd += [
         "-strict",
         "unofficial",
@@ -825,7 +891,7 @@ def remux_hdr10plus(
     )
     log_paths = {
         name: os.path.join(work_dir, f"{name}.log")
-        for name in ("extract", "dovi", "mux")
+        for name in ("extract", "dovi", "wrap", "mux")
     }
     log_files = {}
     procs = []
@@ -848,26 +914,35 @@ def remux_hdr10plus(
         )
         procs.append(p_dovi)
         p_extract.stdout.close()
+        p_wrap = subprocess.Popen(
+            wrap_cmd,
+            stdin=p_dovi.stdout,
+            stdout=subprocess.PIPE,
+            stderr=log_files["wrap"],
+        )
+        procs.append(p_wrap)
+        p_dovi.stdout.close()
         p_mux = subprocess.Popen(
             mux_cmd,
-            stdin=p_dovi.stdout,
+            stdin=p_wrap.stdout,
             stdout=subprocess.PIPE,
             stderr=log_files["mux"],
             text=True,
         )
         procs.append(p_mux)
-        p_dovi.stdout.close()
+        p_wrap.stdout.close()
 
         run_with_progress(p_mux, total_us)
         mux_rc = p_mux.wait()
         dovi_rc = p_dovi.wait()
+        wrap_rc = p_wrap.wait()
         extract_rc = p_extract.wait()
 
-        if mux_rc != 0 or dovi_rc != 0 or extract_rc != 0:
+        if mux_rc != 0 or dovi_rc != 0 or wrap_rc != 0 or extract_rc != 0:
             for proc in procs:
                 if proc.poll() is None:
                     proc.kill()
-            for name in ("extract", "dovi", "mux"):
+            for name in ("extract", "dovi", "wrap", "mux"):
                 log_files[name].flush()
                 text = read_text_file(log_paths[name])
                 if text:
@@ -905,6 +980,17 @@ def remux_hdr10plus(
             )
             destination.unlink(missing_ok=True)
             return False
+
+    print("  Normalising MP4 index...")
+    if not module.normalise_container(str(destination)):
+        print(
+            "  Error: could not normalise the MP4 sample index; "
+            "output removed."
+        )
+        destination.unlink(missing_ok=True)
+        return False
+
+    module.relocate_moov(str(destination))
 
     problems, _ = module.verify_output(
         str(destination), info, True, bool(info["audio_streams"])
@@ -1040,7 +1126,15 @@ def process_single_file(
         else:
             try:
                 hdr_module = load_hdr10plus_module()
-                hdr_info = hdr_module.probe_source(str(file_path))
+                hdr_progress, hdr_progress_close = make_analysis_progress(
+                    "Analysing HDR10+ / Dolby Vision metadata"
+                )
+                try:
+                    hdr_info = hdr_module.probe_source(
+                        str(file_path), progress=hdr_progress
+                    )
+                finally:
+                    hdr_progress_close()
             except (SystemExit, FileNotFoundError, OSError) as exc:
                 print(f"  Warning: HDR10+ analysis failed ({exc}); remuxing without it.")
                 hdr_info = None
